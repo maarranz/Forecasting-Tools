@@ -27,6 +27,24 @@ Array inputs inherit the model's future index. For models fitted to arrays, an
 indexed evaluation Series supplies labels for consecutive observation steps.
 Irregular training dates ignored by statsmodels are rejected explicitly.
 
+## API overview (Stages 1–5)
+
+Forecast errors are defined as actual minus forecast throughout the API.
+
+| Function | Purpose | Returns |
+|---|---|---|
+| `static_forecast()` | Sequential one-step ARIMA forecasts with fixed parameters and conditional Gaussian intervals | DataFrame |
+| `me()` | Signed mean forecast error (bias) | Float |
+| `mae()` | Mean absolute forecast error | Float |
+| `mse()` | Mean squared forecast error | Float |
+| `rmse()` | Root mean squared forecast error | Float |
+| `mape()` | Mean absolute percentage error; rejects zero actuals | Float (percentage) |
+| `forecast_accuracy()` | ME, MAE, MSE, RMSE, and MAPE together, in that order | Series |
+| `unbiasedness_test()` | Mean-error or joint Mincer–Zarnowitz test; HAC or conventional inference | Dictionary |
+| `weak_efficiency_test()` | Ljung–Box diagnostic on errors, or MA(h−1) residuals for multistep forecasts | Dictionary |
+| `orthogonality_test()` | Joint test of zero intercept and coefficients on origin-available information; HAC or conventional inference | Dictionary |
+| `mgn_test()` | Morgan–Granger–Newbold covariance restriction for two forecasts; equal-MSFE interpretation requires zero population mean errors | Dictionary |
+
 ## Installation
 
 The standard environment uses Python 3.13, pandas below version 3, and
@@ -113,8 +131,10 @@ runs both the accuracy and static forecasting tests.
 ## Demonstration notebook
 
 [Forecasting-Tools demonstration](Notebooks/Forecasting_Tools_Demo.ipynb) uses
-reproducible simulated ARMA data to illustrate static ARIMA forecasting and
-forecast accuracy evaluation, with tables and four figures. It optionally
+reproducible simulated ARMA data to demonstrate the API through **Stage 5**:
+static ARIMA forecasting, forecast accuracy, unbiasedness, weak efficiency,
+orthogonality, and Morgan–Granger–Newbold comparison with conventional and HAC
+inference. Notebook **v0.3.0** includes tables and five figures. It
 integrates the two packages through ARIMA-Tools diagnostics and its documented
 Statsmodels estimation workflow; ARIMA-Tools currently has no public fixed-order
 fitting function. Forecasting-Tools itself remains independent of ARIMA-Tools.
@@ -123,9 +143,8 @@ ARIMA-Tools must be available to execute this particular notebook. Clone it as a
 sibling repository. StatsForecast is included in the standard environment to
 satisfy ARIMA-Tools' unconditional import; the Forecasting-Tools API itself does
 not import or depend internally on StatsForecast. No separate demonstration
-environment is needed with the updated specification. The notebook's earlier
-optional-environment setup remains an alternative for older installations;
-select `Python (forecasting_tools)` when using the standard environment above.
+environment is needed with the updated specification. Select
+`Python (forecasting_tools)` when using the standard environment above.
 The notebook supports launching from either the repository root or `Notebooks/`.
 
 ## Forecast unbiasedness tests
@@ -257,4 +276,62 @@ serial restrictions need not imply independence, supplied information may omit
 predictors, nonlinear predictability may remain, and tests can have limited
 power. HAC inference does not repair look-ahead bias, endogeneity, or first-stage
 estimation effects. See the NumPy-style function docstrings for assumptions and
-stable return keys. Run the complete Stage 1–4 suite with the pytest command above.
+stable return keys. Run the complete Stage 1–5 suite with the pytest command above.
+
+## Morgan–Granger–Newbold forecast comparison
+
+`mgn_test(actual, forecast1, forecast2)` forms errors e1 = actual − forecast1
+and e2 = actual − forecast2, then estimates
+`u = intercept + slope * v + disturbance`, where u = e1 + e2 and v = e1 − e2.
+It tests **only** the two-sided slope null H0: slope = 0; the intercept remains
+unrestricted.
+
+```python
+import forecasting_tools as ft
+
+actual = [10, 20, 30, 40, 50]
+forecast1 = [9, 22, 27, 39, 48]
+forecast2 = [12, 19, 31, 37, 51]
+comparison = ft.mgn_test(actual, forecast1, forecast2)  # default HAC inference
+print(comparison["parameters"], comparison["statistic"], comparison["pvalue"])
+classical = ft.mgn_test(actual, forecast1, forecast2, cov_type="nonrobust")
+print(classical["correlation"], classical["statistic"], classical["df"])
+```
+
+The default HAC covariance uses Bartlett weights without an additional
+small-sample multiplier and bandwidth `min(N-1, floor(4*(N/100)**(2/9)))`,
+unless `maxlags` is specified. Slope inference uses an asymptotic normal z
+statistic. Conventional OLS inference uses Student t(N−2) and reproduces the
+classical correlation statistic `r * sqrt((N-2)/(1-r**2))` for r = Corr(u,v).
+Leave `maxlags=None` with conventional covariance. Both choices estimate the
+same slope but use different covariance estimators; HAC standard errors need
+not be larger. Conventional exact inference requires independent observations
+and suitable normal/homoskedastic regression assumptions. HAC permits
+heteroskedasticity and weak serial dependence under regularity conditions.
+HAC inference is asymptotic;
+the short example illustrates syntax, not reliable small-sample evidence.
+
+**MSFE interpretation requires both errors to have zero population means.**
+With this assumption, the slope null corresponds to equality of population
+mean squared forecast errors. Without it, the regression tests equality of
+centered error variances—a covariance restriction—not equality of expected
+squared losses. Failure to reject an unbiasedness test does not establish the
+zero-mean assumption. Direct squared-loss-differential testing is reserved for
+Diebold–Mariano in Stage 6.
+
+The result dictionary reports coefficients, standard errors, marginal confidence
+intervals, correlation, matched statistic/distribution, p-value, degrees of
+freedom, rejection decision, and selected bandwidth. `mean_errors`, `mse`, and
+`mse_difference` provide descriptive summaries; the difference is model1 minus
+model2, so positive values indicate smaller sample MSE for model2. These summaries
+are not used to construct an additional test. The result also carries an explicit
+`msfe_interpretation_note`.
+
+All observations must refer to the same evaluation periods. Any two pandas
+Series among the three inputs must have matching indexes in the same order;
+other inputs are positional. Nothing is silently truncated, reordered, or
+removed. At least three observations are needed. Constant error sums/differences,
+perfect or near-perfect collinearity, zero residual variance, and invalid
+covariance are rejected with informative errors. Failure to reject MGN does not
+prove equal forecasting performance or optimality. The full Stage 1–5 pytest
+suite uses the testing command above; no new dependencies are required.

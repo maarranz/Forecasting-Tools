@@ -983,3 +983,187 @@ def orthogonality_test(actual, forecast, information, h=1, cov_type="HAC",
         "information_names": names,
         "bandwidth_covers_overlap": None if classical else bandwidth >= int(h) - 1,
     }
+
+
+def mgn_test(actual, forecast1, forecast2, cov_type="HAC", maxlags=None,
+             alpha=0.05):
+    r"""Compare two forecast-error variances through the MGN regression.
+
+    Parameters
+    ----------
+    actual : numpy.ndarray, sequence, or pandas.Series
+        Nonempty, one-dimensional finite real evaluation observations.
+    forecast1, forecast2 : numpy.ndarray, sequence, or pandas.Series
+        Forecasts for the same observations, with errors e1 = actual-forecast1
+        and e2 = actual-forecast2. All lengths must match. Any two pandas Series
+        among the three inputs must have identical indexes in the same order.
+        Mixed labeled/unlabeled inputs pair positionally. No observations are
+        truncated, reordered, aligned, or discarded. At least three pairs are
+        required, with nondegenerate sum/difference and regression residuals.
+    cov_type : {"HAC", "nonrobust"}, default "HAC"
+        HAC uses Newey-West/Bartlett covariance without a small-sample
+        multiplier, asymptotic normal slope inference, and normal marginal
+        coefficient intervals. nonrobust uses ordinary OLS covariance,
+        Student t slope inference, and t intervals with N-2 degrees of freedom.
+    maxlags : int or None, default None
+        HAC bandwidth q. None selects min(N-1, floor(4*(N/100)**(2/9))),
+        as in Stages 3 and 4. Explicit bandwidth must be a nonnegative integer
+        below N; booleans are rejected. nonrobust requires None. Observation
+        order must represent consecutive forecast evaluation periods. The
+        caller must choose a suitable bandwidth for overlap/serial dependence.
+    alpha : float, default 0.05
+        Significance level strictly between zero and one. Coefficient interval
+        coverage is 1-alpha; rejection occurs when pvalue < alpha.
+        This argument is distinct from the regression intercept.
+
+    Returns
+    -------
+    dict
+        ``method`` ("mgn"), ``null_hypothesis`` ("slope = 0"), ``nobs``,
+        ``statistic`` (signed slope divided by its standard error),
+        ``distribution`` ("normal" or "t"), ``df`` (None or N-2),
+        ``df_resid`` (N-2), ``n_restrictions`` (1), ``pvalue`` (two-sided),
+        ``alpha``, ``reject_null``, ``cov_type``, ``maxlags`` (selected bandwidth
+        or None), and ``correlation`` (sample correlation of u and v).
+        ``parameters`` and ``standard_errors`` are float dictionaries keyed
+        by "intercept" and "slope". ``confidence_intervals`` maps those names
+        to marginal (lower, upper) tuples. ``mean_errors`` and ``mse`` are
+        descriptive float dictionaries keyed by "model1" and "model2".
+        ``mse_difference`` is sample MSE(model1)-MSE(model2); a positive value
+        means model2 has smaller sample MSE. ``msfe_interpretation_note`` states
+        the required zero-population-mean assumption. No additional hypothesis
+        test is constructed from these descriptive MSE summaries.
+
+    Raises
+    ------
+    TypeError
+        For nonnumeric observations.
+    ValueError
+        For invalid options/samples, inconsistent indexes/lengths, insufficient
+        observations, constant or numerically degenerate u/v, perfect or
+        near-perfect correlation, rank deficiency, zero residual variance,
+        singular/invalid covariance, or overflow/nonfinite calculations.
+
+    Notes
+    -----
+    Define u_t=e1_t+e2_t and v_t=e1_t-e2_t. Estimate
+    u_t = a + b*v_t + disturbance_t and test H0: b=0 against H1: b!=0.
+    The intercept is unrestricted. With positive Var(v), this tests
+    Cov(u,v)=Var(e1)-Var(e2)=0. Only if BOTH errors have zero population means
+    does this equal the null of equal population MSFE, E(e1**2)=E(e2**2).
+    Otherwise the intercept regression tests equality of centered error
+    variances, not equality of expected squared losses. Small sample mean
+    errors or failed unbiasedness rejections do not prove the population
+    assumption. Direct loss-differential inference belongs to Diebold-Mariano.
+
+    Conventional inference reproduces the classical correlation statistic
+    t = r*sqrt((N-2)/(1-r**2)), r=Corr(u,v), using Student t(N-2).
+    Exact conventional reference inference requires independent observations
+    and suitable normal/homoskedastic regression assumptions. HAC allows
+    heteroskedasticity and weak serial dependence under regularity conditions
+    but is asymptotic and may be unreliable in small samples. Neither choice
+    automatically resolves first-stage estimation effects or bandwidth choice.
+
+    For numerical safeguards, reject 1-r**2 <= 1e-12 (perfect/near-perfect
+    collinearity); correlation is computed from scaled centered vectors to
+    avoid unnecessary overflow. Numerically rank-deficient designs or
+    degenerate covariance are also rejected rather than returning unstable
+    p-values. Rejection concerns the stated covariance restriction. Failure
+    to reject does not establish equal forecasting performance or optimality.
+    Swapping models flips the statistic's sign but preserves its two-sided
+    p-value. A statistic's performance interpretation requires the assumptions
+    above, not merely the ordering of descriptive sample MSEs.
+
+    Examples
+    --------
+    >>> actual = [10, 20, 30, 40, 50]
+    >>> forecast1 = [9, 22, 27, 39, 48]
+    >>> forecast2 = [12, 19, 31, 37, 51]
+    >>> result = mgn_test(actual, forecast1, forecast2, cov_type="nonrobust")
+    >>> result['distribution'], result['df']
+    ('t', 3)
+    >>> round(result['mse_difference'], 6)
+    0.6
+    >>> result = mgn_test(actual, forecast1, forecast2, maxlags=1)
+    >>> result['distribution'], result['maxlags']
+    ('normal', 1)
+    """
+    from statsmodels.regression.linear_model import OLS
+
+    if not isinstance(cov_type, str) or cov_type not in ("HAC", "nonrobust"):
+        raise ValueError("cov_type must be 'HAC' or 'nonrobust'")
+    _efficiency_options(1, alpha)
+    if maxlags is not None:
+        if (isinstance(maxlags, (bool, np.bool_)) or not isinstance(maxlags, numbers.Integral)
+                or maxlags < 0):
+            raise ValueError("maxlags must be None or a nonnegative integer")
+        if cov_type == "nonrobust":
+            raise ValueError("maxlags is only applicable to HAC; use None with nonrobust")
+    actual_values, first = _accuracy_inputs(actual, forecast1)
+    _, second = _accuracy_inputs(actual, forecast2)
+    # Check forecast indexes even when actual is an unlabeled array.
+    _accuracy_inputs(forecast1, forecast2)
+    n = len(actual_values)
+    if n < 3:
+        raise ValueError("MGN regression inference requires at least three observations")
+    if maxlags is not None and maxlags >= n:
+        raise ValueError("HAC maxlags must be smaller than the number of observations")
+    with np.errstate(over="raise", invalid="raise", divide="raise"):
+        try:
+            e1, e2 = actual_values - first, actual_values - second
+            u, v = e1 + e2, e1 - e2
+            mean_errors = {"model1": float(e1.mean()), "model2": float(e2.mean())}
+            squared_errors = {"model1": float(np.mean(np.square(e1))),
+                              "model2": float(np.mean(np.square(e2)))}
+            mse_difference = squared_errors["model1"] - squared_errors["model2"]
+            _efficiency_variation(u, "MGN error sum u")
+            _efficiency_variation(v, "MGN error difference v")
+            centered_u, centered_v = u - u.mean(), v - v.mean()
+            scaled_u = centered_u / np.max(np.abs(centered_u))
+            scaled_v = centered_v / np.max(np.abs(centered_v))
+            correlation = float((scaled_u @ scaled_v) /
+                                (np.linalg.norm(scaled_u) * np.linalg.norm(scaled_v)))
+        except FloatingPointError as exc:
+            raise ValueError("MGN calculations overflow or are numerically invalid; rescale observations") from exc
+    if not np.isfinite(mse_difference):
+        raise ValueError("MSE difference is nonfinite; rescale observations")
+    correlation = float(np.clip(correlation, -1.0, 1.0))
+    if 1 - correlation ** 2 <= 1e-12:
+        raise ValueError("MGN sum and difference are perfectly or near-perfectly collinear; inference is undefined")
+    x = np.column_stack([np.ones(n), v])
+    if np.linalg.matrix_rank(x) != 2:
+        raise ValueError("MGN regression design is numerically rank-deficient; rescale or revise the errors")
+    fit = OLS(u, x, missing="raise").fit(use_t=True)
+    if np.linalg.norm(fit.resid) <= n * np.finfo(float).eps * max(1.0, np.linalg.norm(u)):
+        raise ValueError("MGN residual variance is zero or numerically degenerate")
+    bandwidth = None
+    classical = cov_type == "nonrobust"
+    if not classical:
+        bandwidth = min(n - 1, int(np.floor(4 * (n / 100) ** (2 / 9)))) if maxlags is None else int(maxlags)
+        fit = fit.get_robustcov_results(cov_type="HAC", use_t=False, maxlags=bandwidth,
+                                        kernel="bartlett", use_correction=False)
+    covariance = np.asarray(fit.cov_params())
+    if not np.isfinite(covariance).all() or np.linalg.matrix_rank(covariance) != 2:
+        raise ValueError("MGN parameter covariance is nonfinite or singular; inference is undefined")
+    try:
+        np.linalg.cholesky(covariance)
+    except np.linalg.LinAlgError as exc:
+        raise ValueError("MGN parameter covariance is not positive definite; inference is undefined") from exc
+    test = fit.t_test(np.array([[0.0, 1.0]]), use_t=classical)
+    statistic, pvalue = float(np.asarray(test.statistic).item()), float(np.asarray(test.pvalue).item())
+    intervals = np.asarray(fit.conf_int(alpha=float(alpha)))
+    if not np.isfinite([statistic, pvalue, *fit.params, *fit.bse]).all() or not np.isfinite(intervals).all():
+        raise ValueError("MGN inference results are nonfinite; rescale observations or revise the design")
+    names = ["intercept", "slope"]
+    return {
+        "method": "mgn", "null_hypothesis": "slope = 0", "nobs": n,
+        "statistic": statistic, "distribution": "t" if classical else "normal",
+        "df": n - 2 if classical else None, "df_resid": n - 2, "n_restrictions": 1,
+        "pvalue": pvalue, "alpha": float(alpha), "reject_null": bool(pvalue < alpha),
+        "cov_type": cov_type, "maxlags": bandwidth, "correlation": correlation,
+        "parameters": dict(zip(names, map(float, fit.params))),
+        "standard_errors": dict(zip(names, map(float, fit.bse))),
+        "confidence_intervals": dict(zip(names, [tuple(map(float, row)) for row in intervals])),
+        "mean_errors": mean_errors, "mse": squared_errors, "mse_difference": mse_difference,
+        "msfe_interpretation_note": "Equal-MSFE interpretation requires both errors to have zero population means; otherwise this tests a covariance (centered-variance) restriction. Sample MSE summaries are descriptive only.",
+    }
