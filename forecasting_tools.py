@@ -619,3 +619,367 @@ def unbiasedness_test(actual, forecast, method="mean_error", cov_type="HAC",
         "df_num": k if distribution == "F" else None,
         "df_denom": df_resid if distribution == "F" else None,
     }
+
+
+def _efficiency_options(h, alpha):
+    """Validate horizon and significance level for efficiency diagnostics."""
+    if isinstance(h, (bool, np.bool_)) or not isinstance(h, numbers.Integral) or h < 1:
+        raise ValueError("h must be a positive integer forecast horizon")
+    if (isinstance(alpha, (bool, np.bool_)) or not isinstance(alpha, numbers.Real)
+            or not 0 < alpha < 1):
+        raise ValueError("alpha must be a finite number strictly between zero and one")
+
+
+def _efficiency_errors(actual, forecast):
+    """Validate observations and compute errors without numerical overflow."""
+    actual_values, forecast_values = _accuracy_inputs(actual, forecast)
+    with np.errstate(over="raise", invalid="raise"):
+        try:
+            return actual_values - forecast_values
+        except FloatingPointError as exc:
+            raise ValueError("Forecast errors overflow; rescale observations") from exc
+
+
+def _efficiency_variation(values, label):
+    """Reject absent or numerically negligible residual variation."""
+    if not np.isfinite(values).all():
+        raise ValueError(f"{label} contains nonfinite values")
+    centered = values - values.mean()
+    if (not np.isfinite(centered).all()
+            or np.linalg.norm(centered) <= len(values) * np.finfo(float).eps
+            * max(1.0, np.linalg.norm(values))):
+        raise ValueError(f"{label} variance is zero or numerically degenerate")
+
+
+def weak_efficiency_test(actual, forecast, h=1, lags=10, alpha=0.05):
+    r"""Check serial-correlation restrictions on consecutive forecast errors.
+
+    Parameters
+    ----------
+    actual : numpy.ndarray, sequence, or pandas.Series
+        One-dimensional finite real evaluation observations, in time order.
+    forecast : numpy.ndarray, sequence, or pandas.Series
+        Finite forecasts of equal length, with errors e_(t+h|t) = actual -
+        forecast. Two Series must have identical indexes in the same order;
+        other pairs are positional. Missing observations are never removed.
+    h : int, default 1
+        Positive forecast horizon. h=1 applies Ljung-Box directly to errors.
+        h>1 estimates ARIMA(0,0,h-1) with a constant mean and invertibility
+        enforced, then applies Ljung-Box to its one-step filtering residuals.
+        Errors must correspond to forecasts issued at consecutive origins.
+    lags : int, default 10
+        Single positive diagnostic lag m: autocorrelations at lags 1,...,m
+        enter one portmanteau test, rather than m separate tests. Must be
+        smaller than the diagnostic sample size and greater than h-1.
+        Invalid lags are rejected, not silently omitted. Multistep estimation
+        also requires n > (h-1)+2, leaving observations beyond the estimated
+        MA coefficients, mean, and variance parameters.
+    alpha : float, default 0.05
+        Significance level strictly between zero and one. Reject when
+        pvalue < alpha.
+
+    Returns
+    -------
+    dict
+        ``method`` ("weak_efficiency"), ``null_hypothesis``, ``h``,
+        ``ma_order`` (h-1), ``lags``, ``statistic``, ``distribution`` ("chi2"),
+        ``pvalue``, ``df`` (lags-ma_order), ``model_df`` (ma_order), ``alpha``,
+        ``reject_null``, ``nobs`` (input size), and ``diagnostic_nobs``.
+        ``ma_coefficients`` maps MA parameter names (ma.L1, etc.) to floats;
+        ``ma_standard_errors`` contains their estimated standard errors.
+        These dictionaries are empty for h=1. ``estimation`` is None for h=1;
+        otherwise it contains ``converged``, ``mean``, ``sigma2``, ``llf``,
+        ``aic``, ``bic``, ``iterations`` (int or None), ``invertible``,
+        ``residual_burn`` and a list of captured ``warnings``. No fitted
+        Statsmodels object is exposed through this return structure.
+
+    Raises
+    ------
+    TypeError
+        For nonnumeric observations.
+    ValueError
+        For invalid inputs/options, insufficient data/lags, zero residual
+        variance, failed or nonconverged MA estimation, or nonfinite inference.
+
+    Notes
+    -----
+    Ljung-Box uses centered diagnostic residuals and
+    Q = n(n+2) * sum(r_j**2 / (n-j), j=1,...,m), with asymptotic chi-square
+    reference. After estimating MA(q), ``model_df=q`` gives m-q degrees of
+    freedom; the fitted mean and innovation variance are not additionally
+    subtracted, following the usual ARMA residual-diagnostic convention.
+    Residuals exclude the fitted model's loglikelihood_burn observations; for
+    this stationary MA specification that value is normally zero.
+
+    Under suitable squared-error optimality and information-set assumptions,
+    one-step errors are uncorrelated and overlapping h-step errors may have
+    dependence through lag h-1. This procedure checks compatibility with an
+    MA(h-1) representation and residual serial-correlation restrictions. It
+    does not establish optimality or the entire covariance structure. It does
+    not test zero bias: a fitted constant absorbs the multistep error mean and
+    Ljung-Box demeaning similarly removes the one-step mean. Use a separate
+    unbiasedness test. Uncorrelatedness also does not imply independence.
+
+    Reference probabilities are approximate, especially in small samples,
+    with conditional heteroskedasticity, near-boundary MA parameters, or when
+    forecast parameter estimation matters. Failure to reject may reflect low
+    power. Horizon metadata and information timing cannot be inferred from
+    input values; no dates are shifted or automatically aligned.
+
+    Examples
+    --------
+    >>> rng = np.random.default_rng(41)
+    >>> errors = rng.normal(size=100)
+    >>> result = weak_efficiency_test(errors, np.zeros(100), lags=5)
+    >>> result['df'], result['ma_order']
+    (5, 0)
+    >>> innovations = rng.normal(size=121)
+    >>> errors = innovations[1:] + 0.4 * innovations[:-1]
+    >>> result = weak_efficiency_test(errors, np.zeros(120), h=2, lags=8)
+    >>> result['df'], result['estimation']['converged']
+    (7, True)
+    """
+    import warnings
+    from statsmodels.stats.diagnostic import acorr_ljungbox
+
+    _efficiency_options(h, alpha)
+    if isinstance(lags, (bool, np.bool_)) or not isinstance(lags, numbers.Integral) or lags < 1:
+        raise ValueError("lags must be a positive integer diagnostic lag")
+    q = int(h) - 1
+    if lags <= q:
+        raise ValueError("Diagnostic lags must exceed the fitted MA order h-1; Ljung-Box needs positive degrees of freedom")
+    errors = _efficiency_errors(actual, forecast)
+    n = len(errors)
+    if lags >= n:
+        raise ValueError("Diagnostic lags must be smaller than the number of observations")
+    if q and n <= q + 2:
+        raise ValueError("MA estimation requires more than ma_order+2 observations")
+    _efficiency_variation(errors, "Forecast error")
+    diagnostic = errors
+    coefficients, standard_errors, estimation = {}, {}, None
+    if q:
+        try:
+            with warnings.catch_warnings(record=True) as captured:
+                warnings.simplefilter("always")
+                fit = ARIMA(errors, order=(0, 0, q), trend="c",
+                            enforce_invertibility=True).fit()
+        except (ValueError, np.linalg.LinAlgError, FloatingPointError, RuntimeError) as exc:
+            raise ValueError(f"MA({q}) estimation failed: {exc}") from exc
+        if not fit.mle_retvals.get("converged", False):
+            raise ValueError(f"MA({q}) estimation did not converge; revise the specification or sample")
+        if not np.isfinite(fit.params).all() or not np.isfinite(fit.bse).all():
+            raise ValueError("MA estimation returned nonfinite parameters or standard errors")
+        parameters = dict(zip(fit.param_names, map(float, fit.params)))
+        if parameters.get("sigma2", 0) <= 0:
+            raise ValueError("Estimated MA innovation variance must be positive")
+        burn = int(fit.loglikelihood_burn)
+        diagnostic = np.asarray(fit.resid, dtype=float)[burn:]
+        coefficients = dict(zip([f"ma.L{j}" for j in range(1, q + 1)], map(float, fit.maparams)))
+        errors_by_name = dict(zip(fit.param_names, map(float, fit.bse)))
+        standard_errors = {name: errors_by_name[name] for name in coefficients}
+        estimation = {
+            "converged": True, "mean": parameters["const"], "sigma2": parameters["sigma2"],
+            "llf": float(fit.llf), "aic": float(fit.aic), "bic": float(fit.bic),
+            "iterations": int(fit.mle_retvals["iterations"]) if "iterations" in fit.mle_retvals else None,
+            "invertible": bool(np.all(np.abs(fit.maroots) > 1)),
+            "residual_burn": burn, "warnings": [str(w.message) for w in captured],
+        }
+        if not np.isfinite([fit.llf, fit.aic, fit.bic]).all():
+            raise ValueError("MA estimation returned nonfinite likelihood diagnostics")
+        if lags >= len(diagnostic):
+            raise ValueError("Diagnostic lags must be smaller than the post-initialization residual sample")
+        _efficiency_variation(diagnostic, "MA residual")
+    test = acorr_ljungbox(diagnostic, lags=[int(lags)], model_df=q, return_df=True)
+    statistic, pvalue = map(float, test.iloc[0][["lb_stat", "lb_pvalue"]])
+    if not np.isfinite([statistic, pvalue]).all():
+        raise ValueError("Ljung-Box inference is nonfinite; revise the lag or residual sample")
+    return {
+        "method": "weak_efficiency", "null_hypothesis": "No diagnostic residual autocorrelation through lags",
+        "h": int(h), "ma_order": q, "lags": int(lags), "statistic": statistic,
+        "distribution": "chi2", "pvalue": pvalue, "df": int(lags) - q, "model_df": q,
+        "alpha": float(alpha), "reject_null": bool(pvalue < alpha), "nobs": n,
+        "diagnostic_nobs": len(diagnostic), "ma_coefficients": coefficients,
+        "ma_standard_errors": standard_errors, "estimation": estimation,
+    }
+
+
+def orthogonality_test(actual, forecast, information, h=1, cov_type="HAC",
+                       maxlags=None, alpha=0.05):
+    r"""Jointly test whether origin-available information predicts errors.
+
+    Parameters
+    ----------
+    actual, forecast : numpy.ndarray, sequence, or pandas.Series
+        Nonempty one-dimensional finite real observations and forecasts, paired
+        in order with errors e_(t+h|t) = actual - forecast. Lengths must match;
+        two Series must have identical indexes. No observations are dropped.
+    information : numpy.ndarray, sequence, pandas.Series, or pandas.DataFrame
+        One or several finite real information variables. A one-dimensional
+        input is one variable; a matrix has observations in rows and variables
+        in columns. Rows must already correspond to the same forecast-error
+        pairs. If information and either actual/forecast have pandas indexes,
+        these must match in the same order. No automatic alignment or shift is
+        performed. Caller must verify every value was available at the forecast
+        origin, not merely at the target date: look-ahead bias invalidates the
+        interpretation. Names are preserved for named Series/DataFrames;
+        unnamed variables use information_1, information_2, etc. Names must be
+        unique and must not equal the reserved parameter name "intercept".
+        Do not include an intercept column; the function supplies it.
+    h : int, default 1
+        Positive forecast horizon, recorded as metadata. h does not shift rows
+        or change regressors. Overlapping forecasts can produce serially
+        dependent regression disturbances.
+    cov_type : {"HAC", "nonrobust"}, default "HAC"
+        HAC uses Bartlett/Newey-West covariance without a small-sample
+        multiplier, an asymptotic chi-square joint Wald test with k restrictions,
+        and normal marginal confidence intervals. nonrobust uses OLS covariance,
+        a classical F(k,n-k) joint test, and Student t marginal intervals.
+        Here k counts the intercept plus all information coefficients.
+    maxlags : int or None, default None
+        HAC bandwidth, using the Stage 3 convention:
+        min(n-1, floor(4*(n/100)**(2/9))) when None. Explicit bandwidth must be
+        a nonnegative integer below n. nonrobust requires None. The automatic
+        rule is not increased based on h; for overlap consider at least h-1
+        lags and potentially more for additional serial dependence. Smaller
+        bandwidths remain allowed and are flagged in the return metadata.
+    alpha : float, default 0.05
+        Significance level strictly between zero and one. Confidence coverage
+        is 1-alpha and rejection occurs when pvalue < alpha.
+
+    Returns
+    -------
+    dict
+        ``method`` ("orthogonality"), ``null_hypothesis``, ``h``, ``nobs``,
+        ``statistic``, ``distribution`` ("chi2" or "F"), ``pvalue``, ``alpha``,
+        ``reject_null``, ``cov_type``, ``maxlags``, ``n_restrictions`` (k),
+        ``df_resid`` (n-k), ``df`` (k for chi-square, otherwise None),
+        ``df_num``/``df_denom`` (k/n-k for F, otherwise None).
+        ``parameters``, ``standard_errors``, ``confidence_intervals`` are
+        dictionaries keyed by "intercept" and information variable names;
+        intervals are (lower, upper) tuples. ``information_names`` lists the
+        input variable names in column order. ``bandwidth_covers_overlap`` is
+        maxlags >= h-1 for HAC, or None for nonrobust.
+
+    Raises
+    ------
+    TypeError
+        For nonnumeric observations/information.
+    ValueError
+        For invalid options, missing/nonfinite data, index/length mismatches,
+        absent information columns, n <= k, duplicate/reserved names,
+        rank-deficient designs, or degenerate residual variance/covariance.
+
+    Notes
+    -----
+    Estimate e_(t+h|t) = a + gamma' z_t + u_(t+h) and jointly test
+    H0: a=0 and gamma=0 against at least one nonzero coefficient. This includes
+    a zero-bias restriction; separate coefficient tests are not substitutes.
+    Failure to reject only concerns the supplied information and functional
+    form; it is not proof of forecast optimality. Predictability from omitted
+    information or nonlinear relations may remain. Weak efficiency examines
+    serial restrictions instead of these explicit information restrictions.
+
+    Exact conventional F inference requires independent homoskedastic Gaussian
+    disturbances and a correctly specified regression; overlapping multistep
+    errors generally call for HAC. HAC inference is asymptotic, can be weak in
+    small samples, and does not fix look-ahead bias, endogenous regressors,
+    first-stage estimation effects, or an inadequate bandwidth. Horizon and
+    availability timing must be established by the caller.
+
+    Examples
+    --------
+    >>> actual = [11, 19, 32, 38, 53, 59]
+    >>> forecast = [10, 20, 30, 40, 50, 60]
+    >>> origin_signal = pd.Series([0, 1, 0, 1, 0, 1], name="origin_signal")
+    >>> result = orthogonality_test(actual, forecast, origin_signal, maxlags=1)
+    >>> result['information_names'], result['n_restrictions']
+    (['origin_signal'], 2)
+    >>> result = orthogonality_test(actual, forecast, origin_signal,
+    ...                             cov_type="nonrobust")
+    >>> result['distribution'], result['df_denom']
+    ('F', 4)
+    """
+    from statsmodels.regression.linear_model import OLS
+
+    _efficiency_options(h, alpha)
+    if not isinstance(cov_type, str) or cov_type not in ("HAC", "nonrobust"):
+        raise ValueError("cov_type must be 'HAC' or 'nonrobust'")
+    if maxlags is not None:
+        if (isinstance(maxlags, (bool, np.bool_)) or not isinstance(maxlags, numbers.Integral)
+                or maxlags < 0):
+            raise ValueError("maxlags must be None or a nonnegative integer")
+        if cov_type == "nonrobust":
+            raise ValueError("maxlags is only applicable to HAC; use None with nonrobust")
+    errors = _efficiency_errors(actual, forecast)
+    n = len(errors)
+    if maxlags is not None and maxlags >= n:
+        raise ValueError("HAC maxlags must be smaller than the number of observations")
+    if isinstance(information, (pd.Series, pd.DataFrame)):
+        for label, sample in (("actual", actual), ("forecast", forecast)):
+            if isinstance(sample, pd.Series) and not sample.index.equals(information.index):
+                raise ValueError(f"information and {label} indexes must match in the same order")
+    if np.ma.isMaskedArray(information) and np.ma.getmaskarray(information).any():
+        raise ValueError("information contains masked observations; missing values are not allowed")
+    try:
+        raw = np.asarray(information)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("information must be a one- or two-dimensional numeric sample") from exc
+    if raw.ndim not in (1, 2):
+        raise ValueError("information must be one- or two-dimensional")
+    if raw.ndim == 1:
+        raw = raw[:, None]
+    if raw.shape[0] != n:
+        raise ValueError("information must have the same number of observations as actual and forecast")
+    if raw.shape[1] == 0:
+        raise ValueError("information must contain at least one variable")
+    if isinstance(information, pd.DataFrame):
+        names = list(information.columns)
+    elif isinstance(information, pd.Series) and information.name is not None:
+        names = [information.name]
+    else:
+        names = [f"information_{j+1}" for j in range(raw.shape[1])]
+    if len(set(names)) != len(names) or "intercept" in names:
+        raise ValueError("information variable names must be unique and not equal 'intercept'")
+    # Reuse the existing numeric validation column by column without alignment.
+    columns = [_accuracy_inputs(raw[:, j], errors)[0] for j in range(raw.shape[1])]
+    x = np.column_stack([np.ones(n), *columns])
+    k = x.shape[1]
+    if n <= k:
+        raise ValueError("Orthogonality inference requires more observations than regression parameters")
+    if np.linalg.matrix_rank(x) != k:
+        raise ValueError("Orthogonality design is rank-deficient; exclude constant or redundant information variables")
+    fit = OLS(errors, x, missing="raise").fit(use_t=True)
+    if np.linalg.norm(fit.resid) <= n * np.finfo(float).eps * max(1.0, np.linalg.norm(errors)):
+        raise ValueError("Residual variance is zero or numerically degenerate; orthogonality inference is undefined")
+    bandwidth = None
+    if cov_type == "HAC":
+        bandwidth = min(n - 1, int(np.floor(4 * (n / 100) ** (2 / 9)))) if maxlags is None else int(maxlags)
+        fit = fit.get_robustcov_results(cov_type="HAC", use_t=False, maxlags=bandwidth,
+                                        kernel="bartlett", use_correction=False)
+    covariance = np.asarray(fit.cov_params())
+    if not np.isfinite(covariance).all() or np.linalg.matrix_rank(covariance) != k:
+        raise ValueError("Parameter covariance is nonfinite or singular; orthogonality inference is undefined")
+    try:
+        np.linalg.cholesky(covariance)
+    except np.linalg.LinAlgError as exc:
+        raise ValueError("Parameter covariance is not positive definite; orthogonality inference is undefined") from exc
+    test = fit.wald_test(np.eye(k), use_f=cov_type == "nonrobust", scalar=True)
+    statistic, pvalue = float(test.statistic), float(test.pvalue)
+    intervals = np.asarray(fit.conf_int(alpha=float(alpha)))
+    if not np.isfinite([statistic, pvalue]).all() or not np.isfinite(intervals).all():
+        raise ValueError("Nonfinite inference results; rescale observations or revise the design")
+    parameters = ["intercept", *names]
+    classical = cov_type == "nonrobust"
+    return {
+        "method": "orthogonality", "null_hypothesis": "intercept = 0 and all information coefficients = 0",
+        "h": int(h), "nobs": n, "statistic": statistic, "distribution": "F" if classical else "chi2",
+        "pvalue": pvalue, "alpha": float(alpha), "reject_null": bool(pvalue < alpha),
+        "cov_type": cov_type, "maxlags": bandwidth, "n_restrictions": k,
+        "df_resid": n - k, "df": None if classical else k,
+        "df_num": k if classical else None, "df_denom": n - k if classical else None,
+        "parameters": dict(zip(parameters, map(float, fit.params))),
+        "standard_errors": dict(zip(parameters, map(float, fit.bse))),
+        "confidence_intervals": dict(zip(parameters, [tuple(map(float, row)) for row in intervals])),
+        "information_names": names,
+        "bandwidth_covers_overlap": None if classical else bandwidth >= int(h) - 1,
+    }

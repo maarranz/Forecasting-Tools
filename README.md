@@ -178,3 +178,83 @@ and unbiasedness is necessary but insufficient for squared-error optimality.
 The environment includes pytest. Run all existing and new tests from the
 repository root with `mamba run -n forecasting_tools python -m pytest tests -v`.
 The earlier unittest tests are discovered by pytest as well.
+
+## Forecast efficiency diagnostics
+
+Weak efficiency checks serial-correlation restrictions. Orthogonality asks
+whether specified information available at the forecast origin predicts errors.
+Both functions use errors defined as actual minus forecast and return structured
+dictionaries with the statistic, reference distribution, p-value, degrees of
+freedom, and rejection decision.
+
+```python
+import numpy as np
+import pandas as pd
+import forecasting_tools as ft
+
+rng = np.random.default_rng(984)
+origin_signal = pd.Series(rng.normal(size=120), name="origin_signal")
+forecast = np.full(120, 100.0)
+actual = forecast + 0.4 * origin_signal.to_numpy() + rng.normal(size=120)
+
+serial = ft.weak_efficiency_test(actual, forecast, h=1, lags=10)
+information_test = ft.orthogonality_test(
+    actual, forecast, origin_signal, h=1, cov_type="HAC"
+)
+print(serial["statistic"], serial["pvalue"], serial["reject_null"])
+print(information_test["parameters"], information_test["pvalue"])
+
+# Overlapping two-step errors can have MA(1) dependence.
+innovations = rng.normal(size=121)
+two_step_errors = innovations[1:] + 0.4 * innovations[:-1]
+overlap = ft.weak_efficiency_test(
+    forecast + two_step_errors, forecast, h=2, lags=10
+)
+print(overlap["ma_coefficients"], overlap["df"], overlap["estimation"])
+```
+
+For `h=1`, Ljung–Box is applied directly to errors. For `h>1`, a constant-mean
+MA(h-1) is fitted with Statsmodels and Ljung–Box is applied to its filtering
+residuals. The degrees-of-freedom adjustment subtracts h-1 estimated MA
+coefficients from the diagnostic lag: `df = lags - (h-1)`. The mean and variance
+are not additionally deducted under the usual ARMA diagnostic convention.
+Diagnostic lags must exceed h-1 and be below the residual sample size; invalid
+lags raise an error. Constant errors, failed/nonconverged MA fits, and degenerate
+residuals are explained explicitly. Multistep results include MA coefficients,
+standard errors, mean, variance, convergence, likelihood criteria, invertibility,
+and captured estimation warnings.
+
+This checks compatibility with an MA(h-1) representation, not optimality or the
+correctness of the entire covariance structure. Ljung–Box centers its input, and
+the multistep model estimates a mean; use the separate unbiasedness test to
+examine bias. Small samples, heteroskedasticity, estimated forecasts, and MA
+parameters near an invertibility boundary can affect the diagnostic's
+approximate reference distribution.
+
+`orthogonality_test` estimates error = intercept + information coefficients +
+disturbance, jointly testing the intercept and **all** information coefficients
+against zero. Named Series and DataFrame columns retain their names. Arrays
+support one variable or an observations-by-variables matrix. The function adds
+the intercept, rejects redundant/constant regressors, and requires more
+observations than coefficients. With `cov_type="nonrobust"` it uses classical
+F inference and t confidence intervals; HAC uses a joint chi-square Wald test
+and normal intervals. HAC uses Bartlett weights without a small-sample
+multiplier and the Stage 3 bandwidth rule
+`min(n-1, floor(4*(n/100)**(2/9)))` unless `maxlags` is specified.
+
+**Avoid look-ahead bias:** each information row must contain only values known
+at its forecast origin. A target-date index does not establish availability.
+Inputs are neither shifted nor silently aligned, and pandas indexes must match
+in the same order. Prepare origin-available values yourself before calling the
+function. The horizon is metadata and does not shift observations. For overlapping
+h-step forecasts, consider HAC bandwidth at least h-1, and possibly higher if
+additional serial dependence is present. The automatic rule does not enforce
+that minimum; `bandwidth_covers_overlap` reports whether the chosen bandwidth
+covers h-1 lags.
+
+Failure to reject either procedure does not establish forecast optimality:
+serial restrictions need not imply independence, supplied information may omit
+predictors, nonlinear predictability may remain, and tests can have limited
+power. HAC inference does not repair look-ahead bias, endogeneity, or first-stage
+estimation effects. See the NumPy-style function docstrings for assumptions and
+stable return keys. Run the complete Stage 1–4 suite with the pytest command above.
