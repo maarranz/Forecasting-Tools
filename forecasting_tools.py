@@ -1314,3 +1314,191 @@ def dm_test(actual, forecast1, forecast2, loss="squared", h=1,
             "hln": bool(hln), "hln_factor": factor, "df": n-1 if hln else None,
             "distribution": "t" if hln else "normal", "alpha": float(alpha),
             "reject_null": bool(pvalue < alpha)}
+
+
+def encompassing_test(actual, forecast1, forecast2, method="difference",
+                      direction="1_encompasses_2", include_intercept=False,
+                      maxlags=None, alpha=0.05):
+    r"""Test forecast encompassing restrictions using Bartlett HAC inference.
+
+    Parameters
+    ----------
+    actual, forecast1, forecast2 : array-like or pandas.Series
+        Finite real one-dimensional samples for the same evaluation periods.
+        Any pair of Series must have identical indexes in the same order;
+        other inputs pair positionally. No missing observations are removed,
+        shifted, reordered or aligned. More observations than coefficients
+        are required, with identifiable regressors and nondegenerate residuals.
+    method : {"difference", "cross_forecast", "unrestricted"}, default "difference"
+        Difference: regress the selected model's error on forecast1-forecast2.
+        Cross-forecast: regress that error on the competing forecast.
+        Unrestricted: regress actual on an intercept and both forecasts.
+    direction : {"1_encompasses_2", "2_encompasses_1"}, default "1_encompasses_2"
+        Select the encompassing restriction, as detailed in Notes.
+    include_intercept : bool, default False
+        Add an unrestricted intercept for difference/cross_forecast. This
+        changes the restriction from an uncentered orthogonality condition to
+        a conditional, centered one. Unrestricted always includes an intercept:
+        pass False (the default); True is rejected as a redundant option.
+    maxlags : int or None, default None
+        Nonnegative Bartlett bandwidth below N. None selects
+        min(N-1, floor(4*(N/100)**(2/9))). Explicit choices are not changed.
+        Observation order must represent consecutive evaluation periods;
+        choose bandwidth to reflect overlap and any additional dependence.
+    alpha : float, default 0.05
+        Significance level in (0, 1); marginal interval coverage is 1-alpha.
+
+    Returns
+    -------
+    dict
+        ``method``, ``direction``, ``nobs``, ``include_intercept`` (actual
+        fitted specification), ``parameters``, ``standard_errors``,
+        ``confidence_intervals``, ``null_hypothesis``, ``statistic``,
+        ``distribution`` ("normal" or "chi2"), ``df`` (None or 2),
+        ``df_resid``, ``n_restrictions``, ``pvalue``, ``alpha``,
+        ``reject_null``, ``cov_type`` ("HAC"), and ``maxlags``.
+        Coefficient labels are ``intercept`` when fitted and
+        ``forecast_difference``, ``competing_forecast``, or ``forecast1`` and
+        ``forecast2`` according to method. Single-restriction statistics are
+        signed normal z statistics; unrestricted returns a joint Wald chi-square.
+
+    Raises
+    ------
+    TypeError
+        For nonnumeric observations, including booleans.
+    ValueError
+        For invalid options, incompatible inputs, insufficient observations,
+        unidentified/rank-deficient designs, nonfinite calculations, zero
+        residual variance, or singular/nonpositive-definite HAC covariance.
+
+    Notes
+    -----
+    Let e1 = actual-forecast1, e2 = actual-forecast2, and d = forecast1-forecast2.
+    Difference specifications are e1 = beta*d + u and e2 = beta*d + u for
+    directions 1_encompasses_2 and 2_encompasses_1, respectively; d retains its
+    sign in both directions. Test beta=0. Optional intercept is unrestricted.
+    Cross-forecast specifications are e1 = delta*forecast2 + u and
+    e2 = gamma*forecast1 + u, respectively, testing delta=0 or gamma=0.
+    These impose different orthogonality restrictions and are not generally
+    equivalent to difference regressions.
+
+    Unrestricted estimates actual = a0 + a1*forecast1 + a2*forecast2 + u.
+    Direction 1 tests (a1,a2)=(1,0); direction 2 tests (a1,a2)=(0,1).
+    The intercept is always unrestricted. This two-restriction null differs
+    from exclusion-only a2=0 and from the three-restriction null additionally
+    setting a0=0; those alternatives are not implemented here.
+
+    HAC uses Newey-West/Bartlett weights, no small-sample covariance multiplier,
+    normal marginal intervals and two-sided normal single-coefficient tests,
+    or asymptotic chi-square(2) joint inference. These require appropriate
+    moments, weak dependence and stationarity; finite samples, bandwidth choice,
+    endogeneity and forecast-parameter estimation can affect inference.
+    Identical forecasts invalidate difference and unrestricted designs but
+    need not invalidate a cross-forecast diagnostic. A nonzero constant
+    regressor without an intercept is identifiable; with an intercept it is
+    redundant and rejected. Such constant-only diagnostics do not identify
+    varying competing information.
+
+    Failure to reject means we cannot reject the stated encompassing restriction,
+    not proof of encompassing. Rejection does not establish superior accuracy
+    for the competing forecast. Difference regressions connect conceptually
+    to constrained combinations whose weights sum to one; complementary
+    information can motivate investigating combinations. No combination
+    forecasts or weights are produced by this API, and neither rejection nor
+    nonrejection guarantees whether combining will improve out-of-sample loss.
+
+    Examples
+    --------
+    >>> result = encompassing_test([10, 20, 30, 40, 50],
+    ...     [9, 22, 27, 39, 48], [12, 19, 31, 37, 51], maxlags=1)
+    >>> result['distribution'], result['n_restrictions']
+    ('normal', 1)
+    >>> result = encompassing_test([10, 20, 30, 40, 50],
+    ...     [9, 22, 27, 39, 48], [12, 19, 31, 37, 51], method='unrestricted')
+    >>> result['include_intercept'], result['df']
+    (True, 2)
+    """
+    from statsmodels.regression.linear_model import OLS
+
+    if not isinstance(method, str) or method not in ("difference", "cross_forecast", "unrestricted"):
+        raise ValueError("method must be 'difference', 'cross_forecast', or 'unrestricted'")
+    if not isinstance(direction, str) or direction not in ("1_encompasses_2", "2_encompasses_1"):
+        raise ValueError("direction must be '1_encompasses_2' or '2_encompasses_1'")
+    if not isinstance(include_intercept, (bool, np.bool_)):
+        raise ValueError("include_intercept must be a boolean")
+    if method == "unrestricted" and include_intercept:
+        raise ValueError("unrestricted already includes an intercept automatically; leave include_intercept=False")
+    _efficiency_options(1, alpha)
+    if maxlags is not None and (isinstance(maxlags, (bool, np.bool_))
+            or not isinstance(maxlags, numbers.Integral) or maxlags < 0):
+        raise ValueError("maxlags must be None or a nonnegative integer")
+    for name, values in (("actual", actual), ("forecast1", forecast1), ("forecast2", forecast2)):
+        if any(isinstance(v, (bool, np.bool_)) for v in np.asarray(values, dtype=object).flat):
+            raise TypeError(f"{name} must contain real numeric observations, not booleans")
+    y, f1 = _accuracy_inputs(actual, forecast1)
+    _, f2 = _accuracy_inputs(actual, forecast2)
+    _accuracy_inputs(forecast1, forecast2)
+    n = len(y)
+    if maxlags is not None and maxlags >= n:
+        raise ValueError("HAC maxlags must be smaller than the number of observations")
+    has_intercept = method == "unrestricted" or bool(include_intercept)
+    first_direction = direction == "1_encompasses_2"
+    with np.errstate(over="raise", invalid="raise", divide="raise"):
+        try:
+            if method == "unrestricted":
+                target = y
+                x = np.column_stack([np.ones(n), f1, f2])
+                names = ["intercept", "forecast1", "forecast2"]
+                restriction = np.array([[0., 1., 0.], [0., 0., 1.]])
+                null_values = np.array([1., 0.]) if first_direction else np.array([0., 1.])
+                null_label = "forecast1 = 1 and forecast2 = 0" if first_direction else "forecast1 = 0 and forecast2 = 1"
+            else:
+                target = y-(f1 if first_direction else f2)
+                regressor = f1-f2 if method == "difference" else (f2 if first_direction else f1)
+                label = "forecast_difference" if method == "difference" else "competing_forecast"
+                names = (["intercept"] if has_intercept else []) + [label]
+                x = np.column_stack([np.ones(n), regressor]) if has_intercept else regressor[:, None]
+                restriction = np.zeros((1, len(names)))
+                restriction[0, -1] = 1.
+                null_values = np.zeros(1)
+                null_label = f"{label} = 0"
+            k = x.shape[1]
+            if n <= k:
+                raise ValueError("Encompassing inference requires more observations than regression parameters")
+            if not np.isfinite(x).all() or not np.isfinite(target).all():
+                raise ValueError("Encompassing design or errors are nonfinite; rescale observations")
+            if np.linalg.matrix_rank(x) != k:
+                raise ValueError("Encompassing design is rank-deficient; regressors or restrictions are unidentified")
+            fit = OLS(target, x, missing="raise").fit()
+            residual_scale = max(float(np.max(np.abs(target))), float(np.max(np.abs(fit.fittedvalues))))
+            if residual_scale == 0 or np.max(np.abs(fit.resid))/residual_scale <= n*np.finfo(float).eps:
+                raise ValueError("Encompassing residual variance is zero or numerically degenerate")
+            bandwidth = min(n-1, int(np.floor(4*(n/100)**(2/9)))) if maxlags is None else int(maxlags)
+            fit = fit.get_robustcov_results(cov_type="HAC", use_t=False, maxlags=bandwidth,
+                                            kernel="bartlett", use_correction=False)
+            covariance = np.asarray(fit.cov_params())
+            if not np.isfinite(covariance).all() or np.linalg.matrix_rank(covariance) != k:
+                raise ValueError("Encompassing HAC parameter covariance is nonfinite or singular")
+            try:
+                np.linalg.cholesky(covariance)
+            except np.linalg.LinAlgError as exc:
+                raise ValueError("Encompassing HAC covariance is not positive definite") from exc
+            joint = method == "unrestricted"
+            test = (fit.wald_test((restriction, null_values), use_f=False, scalar=True) if joint
+                    else fit.t_test((restriction, null_values), use_t=False))
+            statistic = float(np.asarray(test.statistic).item())
+            pvalue = float(np.asarray(test.pvalue).item())
+            intervals = np.asarray(fit.conf_int(alpha=float(alpha)))
+        except (FloatingPointError, np.linalg.LinAlgError) as exc:
+            raise ValueError("Encompassing calculations are numerically invalid; rescale or revise inputs") from exc
+    if not np.isfinite([statistic, pvalue, *fit.params, *fit.bse]).all() or not np.isfinite(intervals).all():
+        raise ValueError("Encompassing inference is nonfinite; rescale or revise inputs")
+    return {"method": method, "direction": direction, "nobs": n,
+            "include_intercept": has_intercept, "null_hypothesis": null_label,
+            "statistic": statistic, "distribution": "chi2" if joint else "normal",
+            "df": 2 if joint else None, "df_resid": n-k, "n_restrictions": 2 if joint else 1,
+            "pvalue": pvalue, "alpha": float(alpha), "reject_null": bool(pvalue < alpha),
+            "cov_type": "HAC", "maxlags": bandwidth,
+            "parameters": dict(zip(names, map(float, fit.params))),
+            "standard_errors": dict(zip(names, map(float, fit.bse))),
+            "confidence_intervals": dict(zip(names, [tuple(map(float, row)) for row in intervals]))}

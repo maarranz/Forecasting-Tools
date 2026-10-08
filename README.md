@@ -27,7 +27,7 @@ Array inputs inherit the model's future index. For models fitted to arrays, an
 indexed evaluation Series supplies labels for consecutive observation steps.
 Irregular training dates ignored by statsmodels are rejected explicitly.
 
-## API overview (Stages 1–6)
+## API overview (Stages 1–7A)
 
 Forecast errors are defined as actual minus forecast throughout the API.
 
@@ -45,6 +45,7 @@ Forecast errors are defined as actual minus forecast throughout the API.
 | `orthogonality_test()` | Joint test of zero intercept and coefficients on origin-available information; HAC or conventional inference | Dictionary |
 | `mgn_test()` | Morgan–Granger–Newbold covariance restriction for two forecasts; equal-MSFE interpretation requires zero population mean errors | Dictionary |
 | `dm_test()` | Direct HAC test of equal expected squared or absolute losses, with optional HLN correction | Dictionary |
+| `encompassing_test()` | Difference, cross-forecast, or unrestricted encompassing restrictions in either direction; HAC inference | Dictionary |
 
 ## Installation
 
@@ -411,4 +412,145 @@ requires suitable stationarity, moments and weak dependence; small samples,
 bandwidth selection and first-stage estimation effects require care.
 Nonrejection does not prove equal accuracy or optimality. Run all Stage 1–6
 tests with the existing pytest command. The demonstration notebook remains
-v0.3.0 and covers Stages 1–5; Stage 6 is not yet added to it.
+v0.4.0 and covers Stages 1–6; Stage 7A is not yet added to it.
+
+## Forecast Encompassing
+
+### Purpose
+
+`encompassing_test()` examines whether a competing forecast contains additional
+useful linear predictive information under a specified encompassing restriction.
+This differs from equal predictive accuracy: MGN examines a covariance restriction
+(with equal-MSFE interpretation under zero-mean assumptions), while DM directly
+tests equality of expected loss. An encompassing rejection does not automatically
+establish that the competitor is more accurate.
+
+```python
+encompassing_test(actual, forecast1, forecast2, method="difference",
+                  direction="1_encompasses_2", include_intercept=False,
+                  maxlags=None, alpha=0.05)
+```
+
+### Regression specifications
+
+Write e1 = actual − forecast1, e2 = actual − forecast2, and
+**d = forecast1 − forecast2**. The difference retains this sign in both directions.
+The five specifications are:
+
+| Method and direction | Regression (default intercept behavior) | Null hypothesis |
+|---|---|---|
+| Difference: 1 encompasses 2 | e1 = beta d + u | beta = 0 |
+| Difference: 2 encompasses 1 | e2 = beta d + u | beta = 0 |
+| Cross-forecast: 1 encompasses 2 | e1 = delta forecast2 + u | delta = 0 |
+| Cross-forecast: 2 encompasses 1 | e2 = gamma forecast1 + u | gamma = 0 |
+| Unrestricted: either direction | actual = a0 + a1 forecast1 + a2 forecast2 + u | (a1,a2) = (1,0) for 1 encompasses 2; (0,1) for 2 encompasses 1 |
+
+Use `direction="1_encompasses_2"` or `"2_encompasses_1"`. Unrestricted
+regression uses the same fitted equation in either direction, with different
+joint restrictions and an unrestricted intercept.
+
+### Optional intercept
+
+For difference and cross-forecast, `include_intercept=False` reproduces the
+handout's no-constant regressions. Setting it to True adds an unrestricted
+intercept; only the forecast regressor coefficient is tested against zero.
+This changes the specification from uncentered orthogonality to a conditional,
+centered restriction and can change the conclusion. It is not merely a display
+option, and neither form should be described as a universal substitute for the other.
+
+The unrestricted method always includes an intercept. Leave
+`include_intercept=False` (the default): it does not remove that intercept.
+`include_intercept=True` raises an explanatory error because the intercept is
+already included automatically. The returned `include_intercept` describes the
+actual fitted equation and is therefore True for this method.
+
+### Differences between encompassing tests
+
+Difference-based and cross-forecast regressions are **not generally equivalent**.
+They use different predictors and impose different orthogonality restrictions;
+their statistics and conclusions may differ.
+
+In the unrestricted equation, exclusion-only `a2=0` tests additional linear
+explanatory power of forecast2 conditional on forecast1. Stage 7A instead tests
+**jointly** `a1=1, a2=0` for direction 1, leaving a0 free. The alternative
+three-restriction hypothesis `a0=0, a1=1, a2=0` additionally imposes a zero
+intercept. Only the two-restriction joint hypothesis, and its reversed-direction
+counterpart, are implemented; exclusion-only and three-restriction options are
+not provided.
+
+### HAC inference and validation
+
+All methods use Newey–West/Bartlett HAC covariance, without a small-sample
+covariance multiplier. `maxlags=None` selects
+`min(N-1, floor(4*(N/100)**(2/9)))`; an explicit nonnegative integer smaller
+than N is used unchanged. Choose bandwidth with overlap and additional serial
+dependence in mind; the automatic rule is a practical default.
+Single-coefficient restrictions use signed, two-sided asymptotic normal z
+statistics. Unrestricted joint restrictions use a Wald chi-square statistic
+with **two degrees of freedom**. Marginal confidence intervals use normal
+critical values, with coverage 1-alpha; they do not replace the joint test.
+
+Inputs are finite real, one-dimensional, equal-length samples. Any two Series
+must have matching indexes in the same order; other inputs pair positionally.
+Missing observations are neither discarded nor aligned. More observations than
+regression coefficients are required. Rank-deficient designs, degenerate
+residuals and singular/nonpositive-definite covariance raise informative errors.
+Identical forecasts invalidate difference and unrestricted designs, but can
+still permit an identified cross-forecast diagnostic. A nonzero constant
+regressor without an intercept is identifiable; with an intercept it is
+redundant. Constant-only diagnostics do not identify varying competing information.
+
+Results report `method`, `direction`, `nobs`, fitted `include_intercept`,
+`parameters`, `standard_errors`, `confidence_intervals`, `null_hypothesis`,
+`statistic`, `distribution`, `df`, `df_resid`, `n_restrictions`, `pvalue`,
+`alpha`, `reject_null`, `cov_type`, and the actual `maxlags`.
+Coefficient labels are `forecast_difference`, `competing_forecast`, or
+`forecast1` and `forecast2`, plus `intercept` when fitted.
+
+A nonrejection means **we cannot reject the encompassing restriction at the
+chosen significance level**; it does not prove encompassing. HAC inference is
+asymptotic and requires appropriate moments, stationarity and weak dependence.
+Small samples, bandwidth choice, endogeneity and forecast-parameter estimation
+can affect inference.
+
+### Usage examples
+
+This example runs independently:
+
+```python
+import forecasting_tools as ft
+
+actual = [10, 20, 30, 40, 50]
+forecast1 = [9, 22, 27, 39, 48]
+forecast2 = [12, 19, 31, 37, 51]
+result = ft.encompassing_test(
+    actual, forecast1, forecast2,
+    method="difference", direction="1_encompasses_2",
+)
+with_intercept = ft.encompassing_test(
+    actual, forecast1, forecast2,
+    method="difference", direction="1_encompasses_2", include_intercept=True,
+)
+joint = ft.encompassing_test(
+    actual, forecast1, forecast2,
+    method="unrestricted", direction="1_encompasses_2",
+)
+print(result["parameters"], result["pvalue"])
+print(with_intercept["pvalue"], joint["statistic"], joint["df"])
+```
+
+### Connection with forecast combination
+
+Difference regressions connect conceptually to constrained linear combinations
+whose weights sum to one. When neither forecast encompasses the other, their
+information may be complementary, motivating investigation of combinations.
+Rejection does not guarantee improved out-of-sample combination accuracy;
+nonrejection does not establish that combining is useless. Estimating combination
+weights introduces additional statistical and practical considerations.
+**Forecast combination remains on the future-development wish list**: this API
+returns encompassing regression coefficients, not combination weights or
+combined forecasts, and introduces no combination API.
+
+Run the complete Stage 1–7A suite with the existing pytest command. The demo,
+ATSE Labs, handouts and slides are unchanged; Stages 7B and 7C will address those
+teaching materials separately.
