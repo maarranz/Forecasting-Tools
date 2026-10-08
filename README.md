@@ -27,7 +27,7 @@ Array inputs inherit the model's future index. For models fitted to arrays, an
 indexed evaluation Series supplies labels for consecutive observation steps.
 Irregular training dates ignored by statsmodels are rejected explicitly.
 
-## API overview (Stages 1–5)
+## API overview (Stages 1–6)
 
 Forecast errors are defined as actual minus forecast throughout the API.
 
@@ -44,6 +44,7 @@ Forecast errors are defined as actual minus forecast throughout the API.
 | `weak_efficiency_test()` | Ljung–Box diagnostic on errors, or MA(h−1) residuals for multistep forecasts | Dictionary |
 | `orthogonality_test()` | Joint test of zero intercept and coefficients on origin-available information; HAC or conventional inference | Dictionary |
 | `mgn_test()` | Morgan–Granger–Newbold covariance restriction for two forecasts; equal-MSFE interpretation requires zero population mean errors | Dictionary |
+| `dm_test()` | Direct HAC test of equal expected squared or absolute losses, with optional HLN correction | Dictionary |
 
 ## Installation
 
@@ -316,8 +317,7 @@ With this assumption, the slope null corresponds to equality of population
 mean squared forecast errors. Without it, the regression tests equality of
 centered error variances—a covariance restriction—not equality of expected
 squared losses. Failure to reject an unbiasedness test does not establish the
-zero-mean assumption. Direct squared-loss-differential testing is reserved for
-Diebold–Mariano in Stage 6.
+zero-mean assumption. Direct loss-differential testing is provided by `dm_test()` in Stage 6.
 
 The result dictionary reports coefficients, standard errors, marginal confidence
 intervals, correlation, matched statistic/distribution, p-value, degrees of
@@ -335,3 +335,80 @@ perfect or near-perfect collinearity, zero residual variance, and invalid
 covariance are rejected with informative errors. Failure to reject MGN does not
 prove equal forecasting performance or optimality. The full Stage 1–5 pytest
 suite uses the testing command above; no new dependencies are required.
+
+## Diebold–Mariano forecast comparison (Stage 6)
+
+```python
+dm_test(actual, forecast1, forecast2, loss="squared", h=1,
+        alternative="two-sided", maxlags=None, hln=False, alpha=0.05)
+```
+
+Errors are actual minus forecast. The loss differential is
+`d = L(error1) - L(error2)`, where `loss="squared"` uses squared errors and
+`loss="absolute"` uses absolute errors. The null is **E(d) = 0**.
+Negative observed differentials favor model 1; positive values favor model 2.
+Statistical significance is determined by the test, not by the sign alone.
+`alternative="two-sided"` tests unequal expected losses; `"less"` tests lower
+expected loss for model 1, and `"greater"` lower expected loss for model 2.
+Swapping forecasts reverses the statistic and exchanges the one-sided meanings.
+
+The statistic is calculated **directly** as `DM = mean(d) / SE_HAC(mean(d))`.
+For centered d, lag-k autocovariances use divisor N, and the long-run variance is
+`Omega = gamma_0 + 2*sum((1-k/(q+1))*gamma_k, k=1,...,q)`.
+The standard error is `sqrt(Omega/N)`. Bartlett weights and no small-sample
+covariance multiplier match the existing API conventions. This equals the HAC
+statistic for the intercept in `d = intercept + disturbance` with identical
+bandwidth and normalization; an independent Statsmodels regression validates
+the calculation in tests, but is not the public function's computational path.
+
+`maxlags=None` selects `min(N-1, floor(4*(N/100)**(2/9)))`; explicit integer
+bandwidths must be between 0 and N-1. The positive integer horizon `h` does not
+shift data or override bandwidths. For overlapping h-step forecasts, h-1 is a
+conventional bandwidth under suitable assumptions; additional dependence can
+require more lags even for h=1. The automatic rule is a practical default, not
+a universally optimal choice.
+
+By default, `hln=False` reports conventional DM with standard normal inference.
+With `hln=True`, the Harvey–Leybourne–Newbold correction multiplies DM by
+`sqrt((N+1-2*h+h*(h-1)/N)/N)` and uses Student t(N-1) inference. HLN requires
+h < N and a finite, strictly positive factor. It leaves the losses, long-run
+variance, and standard error unchanged. This finite-sample adjustment was
+developed under particular forecasting assumptions; it does not guarantee exact
+inference under arbitrary dependence or heteroskedasticity.
+
+This example runs independently:
+
+```python
+import forecasting_tools as ft
+
+actual = [10, 20, 30, 40, 50]
+forecast1 = [9, 22, 27, 39, 48]
+forecast2 = [12, 19, 31, 37, 51]
+result = ft.dm_test(actual, forecast1, forecast2, loss="squared", h=1,
+                    alternative="two-sided", hln=False)
+result_hln = ft.dm_test(actual, forecast1, forecast2, loss="squared", h=1,
+                        hln=True)
+print(result["dm_statistic"], result["pvalue"])
+print(result_hln["statistic"], result_hln["pvalue"])
+absolute = ft.dm_test(actual, forecast1, forecast2, loss="absolute")
+```
+
+Results include `n`, `h`, `loss`, `alternative`, `mean_loss1`, `mean_loss2`,
+`mean_loss_diff`, `long_run_variance`, `se`, `dm_statistic`, `statistic`,
+`pvalue`, `maxlags`, `hln`, `hln_factor`, `df`, `distribution`, `alpha`, and
+`reject_null`. `dm_statistic` always retains conventional DM; `statistic` is
+identical unless HLN is enabled. `alpha` controls the rejection threshold.
+
+Inputs must be finite, numeric, equal-length one-dimensional samples with at
+least two observations. Any pair of Series must have matching indexes in the
+same order; other inputs pair positionally. Missing observations are never
+removed or realigned. Zero, nonpositive, nonfinite or numerically degenerate
+long-run variance and overflowing calculations raise informative errors.
+
+Unlike MGN's covariance restriction, **DM directly tests equality of expected
+loss without a zero-mean forecast-error assumption**. HAC inference still
+requires suitable stationarity, moments and weak dependence; small samples,
+bandwidth selection and first-stage estimation effects require care.
+Nonrejection does not prove equal accuracy or optimality. Run all Stage 1–6
+tests with the existing pytest command. The demonstration notebook remains
+v0.3.0 and covers Stages 1–5; Stage 6 is not yet added to it.

@@ -1167,3 +1167,150 @@ def mgn_test(actual, forecast1, forecast2, cov_type="HAC", maxlags=None,
         "mean_errors": mean_errors, "mse": squared_errors, "mse_difference": mse_difference,
         "msfe_interpretation_note": "Equal-MSFE interpretation requires both errors to have zero population means; otherwise this tests a covariance (centered-variance) restriction. Sample MSE summaries are descriptive only.",
     }
+
+
+def dm_test(actual, forecast1, forecast2, loss="squared", h=1,
+            alternative="two-sided", maxlags=None, hln=False, alpha=0.05):
+    r"""Test equality of expected forecast losses with direct Bartlett HAC DM.
+
+    Parameters
+    ----------
+    actual, forecast1, forecast2 : array-like or pandas.Series
+        Finite real, one-dimensional observations for identical evaluation
+        periods, with at least two observations. Any pair of Series must have
+        matching indexes in the same order. Other inputs pair positionally;
+        missing observations are never removed or silently aligned.
+    loss : {"squared", "absolute"}, default "squared"
+        Loss L(e) = e**2 or abs(e), with e = actual - forecast.
+    h : int, default 1
+        Positive forecast horizon. Metadata only: does not shift observations
+        or choose the bandwidth. HLN requires h < sample size.
+    alternative : {"two-sided", "less", "greater"}, default "two-sided"
+        Alternative E(d) != 0, E(d) < 0, or E(d) > 0, respectively, for
+        d = L(e1) - L(e2). Negative values favor model 1; positive favor model 2.
+    maxlags : int or None, default None
+        Bartlett bandwidth q, from zero through N-1. None selects
+        min(N-1, floor(4*(N/100)**(2/9))). This practical default is not
+        universally optimal. For overlapping h-step forecasts, h-1 is a
+        conventional choice under suitable assumptions; additional dependence
+        may require more lags. Explicit bandwidths are never overridden.
+    hln : bool, default False
+        Apply Harvey–Leybourne–Newbold correction and Student t(N-1)
+        inference when True; otherwise use conventional asymptotic normal DM.
+    alpha : float, default 0.05
+        Significance level strictly between zero and one.
+
+    Returns
+    -------
+    dict
+        ``n``, ``nobs``, ``h``, ``loss``, ``alternative``, ``mean_loss1``,
+        ``mean_loss2``, ``mean_loss_diff``, ``long_run_variance``, ``se``,
+        ``dm_statistic`` (uncorrected), ``statistic`` (used for inference),
+        ``pvalue``, ``maxlags``, ``hln``, ``hln_factor`` (None if disabled),
+        ``df`` (None or N-1), ``distribution`` ("normal" or "t"), ``alpha``,
+        ``reject_null``, ``method`` and ``null_hypothesis``.
+
+    Raises
+    ------
+    TypeError
+        For nonnumeric observations.
+    ValueError
+        For invalid options, mismatched lengths/indexes, missing/nonfinite
+        observations, fewer than two observations, invalid HLN horizons,
+        overflow, or zero/nonpositive/numerically degenerate long-run variance.
+
+    Notes
+    -----
+    Compute centered autocovariances gamma_k = sum((d_t-dbar)*
+    (d_{t-k}-dbar))/N and Omega = gamma_0 + 2*sum((1-k/(q+1))*gamma_k).
+    The reported conventional DM is computed directly as dbar/sqrt(Omega/N),
+    with no small-sample covariance multiplier. It equals the intercept-only
+    OLS HAC statistic with identical normalization; regression is not used here.
+
+    HLN multiplies DM by sqrt((N+1-2*h+h*(h-1)/N)/N), without changing losses,
+    Omega or SE. It is a finite-sample adjustment developed under particular
+    forecasting assumptions, not exact inference for arbitrary dependence or
+    heteroskedasticity. HAC inference requires suitable stationarity, moments
+    and weak dependence; neither option resolves first-stage estimation effects.
+    Short samples can give unreliable inference. Unlike MGN's covariance
+    restriction, DM directly tests expected loss equality without requiring
+    zero-mean forecast errors. Nonrejection does not prove equal accuracy or
+    optimality; observed loss signs alone do not establish significance.
+
+    Examples
+    --------
+    >>> result = dm_test([10, 20, 30, 40, 50], [9, 22, 27, 39, 48],
+    ...                  [12, 19, 31, 37, 51], maxlags=1)
+    >>> round(result['mean_loss_diff'], 6)
+    0.6
+    >>> result['distribution'], result['hln_factor']
+    ('normal', None)
+    """
+    from scipy.stats import t
+
+    _efficiency_options(h, alpha)
+    if not isinstance(loss, str) or loss not in ("squared", "absolute"):
+        raise ValueError("loss must be 'squared' or 'absolute'")
+    if not isinstance(alternative, str) or alternative not in ("two-sided", "less", "greater"):
+        raise ValueError("alternative must be 'two-sided', 'less', or 'greater'")
+    if not isinstance(hln, (bool, np.bool_)):
+        raise ValueError("hln must be a boolean")
+    if maxlags is not None and (isinstance(maxlags, (bool, np.bool_))
+            or not isinstance(maxlags, numbers.Integral) or maxlags < 0):
+        raise ValueError("maxlags must be None or a nonnegative integer")
+    # Preserve type information before NumPy coerces mixed bool/float sequences.
+    for name, values in (("actual", actual), ("forecast1", forecast1), ("forecast2", forecast2)):
+        raw_objects = np.asarray(values, dtype=object)
+        if any(isinstance(value, (bool, np.bool_)) for value in raw_objects.flat):
+            raise TypeError(f"{name} must contain real numeric observations, not booleans")
+    y, f1 = _accuracy_inputs(actual, forecast1)
+    _, f2 = _accuracy_inputs(actual, forecast2)
+    _accuracy_inputs(forecast1, forecast2)
+    n = len(y)
+    if n < 2:
+        raise ValueError("DM inference requires at least two observations")
+    if maxlags is not None and maxlags >= n:
+        raise ValueError("HAC maxlags must be smaller than the number of observations")
+    if hln and h >= n:
+        raise ValueError("HLN requires forecast horizon h smaller than the sample size")
+    q = min(n-1, int(np.floor(4*(n/100)**(2/9)))) if maxlags is None else int(maxlags)
+    with np.errstate(over="raise", invalid="raise", divide="raise", under="ignore"):
+        try:
+            e1, e2 = y-f1, y-f2
+            l1 = np.square(e1) if loss == "squared" else np.abs(e1)
+            l2 = np.square(e2) if loss == "squared" else np.abs(e2)
+            d = l1-l2
+            mean = float(d.mean())
+            centered = d-mean
+            scale = float(np.max(np.abs(d)))
+            if scale == 0 or np.max(np.abs(centered))/scale <= n*np.finfo(float).eps:
+                raise ValueError("Loss differential variance is zero or numerically degenerate")
+            gamma0 = float(centered @ centered / n)
+            omega = gamma0
+            for k in range(1, q+1):
+                omega += 2*(1-k/(q+1))*float(centered[k:] @ centered[:-k]/n)
+            if not np.isfinite(omega) or omega <= np.finfo(float).eps*gamma0 or gamma0 <= 0:
+                raise ValueError("HAC long-run variance is nonpositive, nonfinite or numerically degenerate")
+            se = float(np.sqrt(omega/n))
+            dm = mean/se
+            means = float(l1.mean()), float(l2.mean())
+        except FloatingPointError as exc:
+            raise ValueError("DM calculations overflow or are numerically invalid; rescale observations") from exc
+    factor = float(np.sqrt((n+1-2*h+h*(h-1)/n)/n)) if hln else None
+    if hln and (not np.isfinite(factor) or factor <= 0):
+        raise ValueError("HLN correction factor must be finite and strictly positive")
+    statistic = dm*factor if hln else dm
+    reference = t(n-1) if hln else norm
+    pvalue = float(2*reference.sf(abs(statistic)) if alternative == "two-sided"
+                   else reference.cdf(statistic) if alternative == "less"
+                   else reference.sf(statistic))
+    if not np.isfinite([mean, omega, se, dm, statistic, pvalue, *means]).all() or se <= 0:
+        raise ValueError("DM inference is nonfinite or numerically degenerate; rescale observations")
+    return {"method": "dm", "null_hypothesis": "Expected loss differential = 0",
+            "n": n, "nobs": n, "h": int(h), "loss": loss, "alternative": alternative,
+            "mean_loss1": means[0], "mean_loss2": means[1], "mean_loss_diff": mean,
+            "long_run_variance": omega, "se": se, "dm_statistic": dm,
+            "statistic": statistic, "pvalue": pvalue, "maxlags": q,
+            "hln": bool(hln), "hln_factor": factor, "df": n-1 if hln else None,
+            "distribution": "t" if hln else "normal", "alpha": float(alpha),
+            "reject_null": bool(pvalue < alpha)}
