@@ -76,3 +76,21 @@ is undefined when any actual value is zero, and can behave poorly near zero.
 The combined function also rejects zero actuals because it includes MAPE;
 the other four individual functions accept zeros. The same test command above
 runs both the accuracy and static forecasting tests.
+
+## Demonstration notebook
+
+[Forecasting-Tools demonstration](Notebooks/Forecasting_Tools_Demo.ipynb) uses
+reproducible simulated ARMA data to illustrate static ARIMA forecasting and
+forecast accuracy evaluation, with tables and four figures. It optionally
+integrates the two packages through ARIMA-Tools diagnostics and its documented
+Statsmodels estimation workflow; ARIMA-Tools currently has no public fixed-order
+fitting function. Forecasting-Tools itself remains independent of ARIMA-Tools.
+
+ARIMA-Tools must be available to execute this particular notebook. Clone it as a
+sibling repository and ensure its dependencies are available in the selected
+kernel. ARIMA-Tools currently imports StatsForecast unconditionally, although
+the demonstrated diagnostics do not use it. This is an optional dependency of
+the integration demonstration, not of Forecasting-Tools. StatsForecast 2.1.1
+requires pandas below version 3; the notebook documents a separate optional
+`forecasting_tools_demo` environment to preserve the existing environment.
+It supports launching from either the repository root or `Notebooks/`.
