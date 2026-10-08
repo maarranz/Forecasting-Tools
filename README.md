@@ -27,10 +27,43 @@ Array inputs inherit the model's future index. For models fitted to arrays, an
 indexed evaluation Series supplies labels for consecutive observation steps.
 Irregular training dates ignored by statsmodels are rejected explicitly.
 
-Run the tests in the existing environment:
+## Installation
+
+The standard environment uses Python 3.13, pandas below version 3, and
+StatsForecast 2.1 or newer, alongside the existing scientific Python and
+Jupyter dependencies. From the repository root, create and activate it:
 
 ```sh
-mamba run -n forecasting_tools python -m unittest discover -s tests -v
+mamba env create -f environment.yml
+mamba activate forecasting_tools
+```
+
+If `forecasting_tools` already exists, creating it again will fail. To apply the
+specification to an existing environment, first back up its specification and
+review the proposed changes:
+
+```sh
+mamba env export -n forecasting_tools > forecasting_tools-environment-backup.yml
+mamba env update -n forecasting_tools -f environment.yml --dry-run
+```
+
+After reviewing the plan, apply it with
+`mamba env update -n forecasting_tools -f environment.yml`.
+An existing Python 3.14 environment will move to Python 3.13, and pandas 3 will
+move to a compatible version below 3. Editing `environment.yml` alone does not
+change any installed environment.
+
+For the demonstration notebook, register and select the environment's kernel:
+
+```sh
+mamba run -n forecasting_tools python -m ipykernel install --user --name forecasting_tools --display-name "Python (forecasting_tools)"
+mamba run -n forecasting_tools jupyter lab Notebooks/Forecasting_Tools_Demo.ipynb
+```
+
+Run the tests in the environment:
+
+```sh
+mamba run -n forecasting_tools python -m pytest tests -v
 ```
 
 Tests compare forecasts and standard errors against a single fixed-parameter
@@ -87,10 +120,61 @@ Statsmodels estimation workflow; ARIMA-Tools currently has no public fixed-order
 fitting function. Forecasting-Tools itself remains independent of ARIMA-Tools.
 
 ARIMA-Tools must be available to execute this particular notebook. Clone it as a
-sibling repository and ensure its dependencies are available in the selected
-kernel. ARIMA-Tools currently imports StatsForecast unconditionally, although
-the demonstrated diagnostics do not use it. This is an optional dependency of
-the integration demonstration, not of Forecasting-Tools. StatsForecast 2.1.1
-requires pandas below version 3; the notebook documents a separate optional
-`forecasting_tools_demo` environment to preserve the existing environment.
-It supports launching from either the repository root or `Notebooks/`.
+sibling repository. StatsForecast is included in the standard environment to
+satisfy ARIMA-Tools' unconditional import; the Forecasting-Tools API itself does
+not import or depend internally on StatsForecast. No separate demonstration
+environment is needed with the updated specification. The notebook's earlier
+optional-environment setup remains an alternative for older installations;
+select `Python (forecasting_tools)` when using the standard environment above.
+The notebook supports launching from either the repository root or `Notebooks/`.
+
+## Forecast unbiasedness tests
+
+`unbiasedness_test` provides two regression-based tests with errors defined as
+actual minus forecast. The default mean-error test estimates an intercept-only
+error regression and tests a zero mean error. Positive estimates indicate
+underforecasting; negative estimates indicate overforecasting.
+
+```python
+import forecasting_tools as ft
+
+actual = [11, 19, 32, 38]
+forecast = [10, 20, 30, 40]
+bias = ft.unbiasedness_test(actual, forecast, method="mean_error")
+calibration = ft.unbiasedness_test(actual, forecast, method="mincer_zarnowitz")
+print(bias["parameters"], bias["pvalue"], bias["reject_null"])
+print(calibration["statistic"], calibration["distribution"], calibration["pvalue"])
+```
+
+Mincer-Zarnowitz estimates actual = intercept + slope * forecast + disturbance
+and **jointly** tests intercept = 0 and slope = 1. Two separate coefficient
+checks cannot replace this joint hypothesis.
+
+The default `cov_type="HAC"` uses Newey-West/Bartlett covariance with no
+small-sample multiplier. Automatic bandwidth is
+`min(n-1, floor(4*(n/100)**(2/9)))`; set `maxlags` to an integer from 0 through
+n-1 to choose it explicitly. Observation order represents consecutive time
+steps. HAC uses normal mean-error inference and chi-square joint inference
+with two restrictions. `cov_type="nonrobust"` uses conventional Student t
+inference and a classical joint F-test; leave `maxlags=None` in that case.
+`alpha` controls confidence coverage (1-alpha) and the rejection threshold.
+
+Results are dictionaries containing specification, statistic, distribution,
+p-value, rejection decision, sample size, bandwidth, parameter estimates,
+standard errors, marginal confidence intervals, and degrees of freedom.
+Use `parameters["intercept"]` for estimated mean error. Mincer-Zarnowitz also
+returns `parameters["slope"]`. See the function docstring for stable result keys.
+
+Inputs follow the accuracy functions' validation rules. Mean-error inference
+needs at least two observations; joint inference needs at least three and
+nonconstant, numerically identifiable forecasts. Zero residual variance and
+singular covariance are rejected with an explanation rather than reporting
+misleading p-values. HAC inference is asymptotic and may be unreliable in small
+samples; classical exact inference requires independent homoskedastic Gaussian
+regression disturbances. Neither covariance choice repairs endogeneity or
+first-stage estimation effects. Failure to reject is not proof of unbiasedness,
+and unbiasedness is necessary but insufficient for squared-error optimality.
+
+The environment includes pytest. Run all existing and new tests from the
+repository root with `mamba run -n forecasting_tools python -m pytest tests -v`.
+The earlier unittest tests are discovered by pytest as well.
